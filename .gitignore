@@ -13,3 +13,12 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# backend (FastAPI)
+backend/.venv/
+backend/.env
+backend/**/__pycache__/
+backend/**/*.pyc
+
+/backend/.venv
+/backend/.env
