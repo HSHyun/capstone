@@ -22,3 +22,5 @@ backend/**/*.pyc
 
 /backend/.venv
 /backend/.env
+backend/uploads/
+backend/*.log
