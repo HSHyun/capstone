@@ -1,9 +1,16 @@
 package com.example.cpstone
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Bundle
+import java.io.ByteArrayOutputStream
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.animateFloat
@@ -13,6 +20,9 @@ import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -95,9 +105,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.KeyboardActions
@@ -125,11 +137,17 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 import com.google.gson.annotations.SerializedName
+import okhttp3.MediaType
+import okhttp3.MultipartBody
+import okhttp3.RequestBody
 import retrofit2.Retrofit
+import retrofit2.Response
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.Multipart
 import retrofit2.http.Path
+import retrofit2.http.Part
 import retrofit2.http.POST
 import retrofit2.http.Query
 
@@ -212,6 +230,49 @@ private data class PostCreateRequestDto(
     val title: String,
     val content: String
 )
+private data class DocumentUploadResponseDto(
+    @SerializedName("document_id") val documentId: Long,
+    @SerializedName("image_url") val imageUrl: String
+)
+private data class OcrMockCategoryDto(
+    val code: String,
+    val name: String
+)
+private data class OcrMockContentDto(
+    val instruction: String,
+    val passage: String
+)
+private data class OcrMockItemDto(
+    val code: String,
+    val number: Int,
+    val category: OcrMockCategoryDto,
+    val content: OcrMockContentDto
+)
+private data class DocumentOcrMockResponseDto(
+    @SerializedName("document_id") val documentId: Long,
+    val status: String,
+    @SerializedName("mock_item") val mockItem: OcrMockItemDto
+)
+private data class ParseSentenceDto(
+    val index: Int,
+    val text: String,
+    val parse: String
+)
+private data class ParseResultJsonDto(
+    val summary: String,
+    @SerializedName("sentence_count") val sentenceCount: Int,
+    val sentences: List<ParseSentenceDto>
+)
+private data class DocumentParseMockResponseDto(
+    @SerializedName("document_id") val documentId: Long,
+    @SerializedName("analysis_run_id") val analysisRunId: Long,
+    val status: String,
+    @SerializedName("result_json") val resultJson: ParseResultJsonDto
+)
+private data class UploadAnalysisData(
+    val ocr: DocumentOcrMockResponseDto,
+    val parse: DocumentParseMockResponseDto?
+)
 
 private interface AuthApi {
     @POST("auth/signup")
@@ -250,6 +311,18 @@ private interface CommunityApi {
     ): LikeToggleResponseDto
 }
 
+private interface UploadApi {
+    @Multipart
+    @POST("documents/upload")
+    suspend fun uploadDocument(@Part image: MultipartBody.Part): Response<DocumentUploadResponseDto>
+
+    @POST("documents/{documentId}/ocr")
+    suspend fun runOcrMock(@Path("documentId") documentId: Long): Response<DocumentOcrMockResponseDto>
+
+    @POST("documents/{documentId}/parse")
+    suspend fun runParseMock(@Path("documentId") documentId: Long): Response<DocumentParseMockResponseDto>
+}
+
 private object ApiClient {
     private val retrofit = Retrofit.Builder()
         .baseUrl(BuildConfig.BASE_URL)
@@ -258,6 +331,7 @@ private object ApiClient {
 
     val authApi: AuthApi = retrofit.create(AuthApi::class.java)
     val communityApi: CommunityApi = retrofit.create(CommunityApi::class.java)
+    val uploadApi: UploadApi = retrofit.create(UploadApi::class.java)
 }
 
 private data class CommunityPostListItem(
@@ -367,13 +441,23 @@ fun MainScreen() {
     var selectedCommunityCategory by remember { mutableStateOf("문제풀이") }
     var communityWriteMode by remember { mutableStateOf(false) }
     var communityRefreshKey by remember { mutableStateOf(0) }
-    var currentUser by remember { mutableStateOf<SignupUserDto?>(null) }
+    var uploadAnalysisResult by remember { mutableStateOf<UploadAnalysisData?>(null) }
+    var currentUser by remember {
+        mutableStateOf<SignupUserDto?>(
+            if (BuildConfig.DEBUG) SignupUserDto(1L, "tester", "test@local") else null
+        )
+    }
     val resetNavToRoot: (String) -> Unit = { target ->
         when (target) {
             "커뮤니티" -> {
                 selectedCommunityPostId = null
                 communityWriteMode = false
                 selectedCommunityCategory = "문제풀이"
+            }
+            "업로드" -> {
+                selectedCommunityPostId = null
+                communityWriteMode = false
+                uploadAnalysisResult = null
             }
             else -> {
                 selectedCommunityPostId = null
@@ -481,6 +565,21 @@ fun MainScreen() {
     ) { innerPadding ->
         when (selectedNav) {
             "홈" -> HomeContent(modifier = Modifier.padding(innerPadding))
+            "업로드" -> {
+                val result = uploadAnalysisResult
+                if (result == null) {
+                    UploadContent(
+                        modifier = Modifier.padding(innerPadding),
+                        onAnalysisReady = { uploadAnalysisResult = it }
+                    )
+                } else {
+                    UploadAnalysisResultContent(
+                        result = result,
+                        modifier = Modifier.padding(innerPadding),
+                        onBack = { uploadAnalysisResult = null }
+                    )
+                }
+            }
             "커뮤니티" -> {
                 if (communityWriteMode) {
                     CommunityWriteContent(
@@ -531,6 +630,420 @@ fun MainScreen() {
                     contentAlignment = Alignment.Center
                 ) {
                     Text("${selectedNav} 화면 준비중", color = TextSecondary)
+                }
+            }
+        }
+    }
+}
+
+private fun decodeBitmapFromUri(context: Context, uri: Uri): Bitmap? = runCatching {
+    context.contentResolver.openInputStream(uri)?.use(BitmapFactory::decodeStream)
+}.getOrNull()
+
+private fun bitmapToUploadPart(bitmap: Bitmap): MultipartBody.Part {
+    val stream = ByteArrayOutputStream()
+    bitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)
+    val bytes = stream.toByteArray()
+    val body = RequestBody.create(MediaType.parse("image/jpeg"), bytes)
+    return MultipartBody.Part.createFormData("image", "capture.jpg", body)
+}
+
+private fun uriToUploadPart(context: Context, uri: Uri): MultipartBody.Part? = runCatching {
+    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+    val mimeType = context.contentResolver.getType(uri) ?: "image/*"
+    val fileName = "upload_${System.currentTimeMillis()}.jpg"
+    val body = RequestBody.create(MediaType.parse(mimeType), bytes)
+    MultipartBody.Part.createFormData("image", fileName, body)
+}.getOrNull()
+
+@Composable
+private fun UploadContent(
+    modifier: Modifier = Modifier,
+    onAnalysisReady: (UploadAnalysisData) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var selectedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var selectedUri by remember { mutableStateOf<Uri?>(null) }
+    var uploadMessage by remember { mutableStateOf<String?>(null) }
+    var uploading by remember { mutableStateOf(false) }
+    val canAnalyze = (selectedBitmap != null || selectedUri != null) && !uploading
+    val cardRadius = RoundedCornerShape(18.dp)
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicturePreview()
+    ) { bitmap ->
+        if (bitmap != null) {
+            selectedBitmap = bitmap
+            selectedUri = null
+            uploadMessage = null
+        }
+    }
+
+    val fileLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            selectedUri = uri
+            selectedBitmap = null
+            uploadMessage = null
+        }
+    }
+
+    Box(
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        Column(
+            modifier = Modifier
+                .width(960.dp)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 12.dp)
+                .padding(bottom = 96.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .softCardShadow(cardRadius),
+                shape = cardRadius,
+                colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text("지문 업로드", color = TextPrimary, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Button(
+                            onClick = { cameraLauncher.launch(null) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(44.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = BrandBlue)
+                        ) {
+                            Text("사진 촬영", color = Color.White, fontWeight = FontWeight.SemiBold)
+                        }
+                        Button(
+                            onClick = { fileLauncher.launch(arrayOf("image/*")) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(44.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = BrandBlue)
+                        ) {
+                            Text("파일 선택", color = Color.White, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .softCardShadow(cardRadius),
+                shape = cardRadius,
+                colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(320.dp)
+                        .padding(12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    when {
+                        selectedBitmap != null -> {
+                            Image(
+                                bitmap = selectedBitmap!!.asImageBitmap(),
+                                contentDescription = "촬영한 이미지",
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                        selectedUri != null -> {
+                            val uriBitmap = remember(selectedUri) { decodeBitmapFromUri(context, selectedUri!!) }
+                            if (uriBitmap != null) {
+                                Image(
+                                    bitmap = uriBitmap.asImageBitmap(),
+                                    contentDescription = "선택한 이미지",
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            } else {
+                                Text("이미지를 불러오지 못했습니다.", color = TextSecondary, fontSize = 13.sp)
+                            }
+                        }
+                        else -> {
+                            Text("선택된 이미지가 없습니다.", color = TextSecondary, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+
+            Button(
+                onClick = {
+                    if (uploading) return@Button
+                    val part = when {
+                        selectedBitmap != null -> bitmapToUploadPart(selectedBitmap!!)
+                        selectedUri != null -> uriToUploadPart(context, selectedUri!!)
+                        else -> null
+                    }
+                    if (part == null) {
+                        uploadMessage = "이미지를 먼저 선택해 주세요."
+                        return@Button
+                    }
+                    scope.launch {
+                        uploading = true
+                        uploadMessage = null
+                        runCatching {
+                            ApiClient.uploadApi.uploadDocument(part)
+                        }.onSuccess { uploadResponse ->
+                            if (!uploadResponse.isSuccessful) {
+                                uploadMessage = "저장 실패 (${uploadResponse.code()})"
+                            } else {
+                                val documentId = uploadResponse.body()?.documentId
+                                if (documentId == null) {
+                                    uploadMessage = "저장 성공, OCR 요청 실패 (document_id 없음)"
+                                } else {
+                                    runCatching {
+                                        ApiClient.uploadApi.runOcrMock(documentId)
+                                    }.onSuccess { ocrResponse ->
+                                        uploadMessage = if (ocrResponse.isSuccessful) {
+                                            val ocrBody = ocrResponse.body()
+                                            if (ocrBody != null) {
+                                                val item = ocrBody.mockItem
+                                                runCatching {
+                                                    ApiClient.uploadApi.runParseMock(documentId)
+                                                }.onSuccess { parseResponse ->
+                                                    val parseBody = if (parseResponse.isSuccessful) parseResponse.body() else null
+                                                    onAnalysisReady(
+                                                        UploadAnalysisData(
+                                                            ocr = ocrBody,
+                                                            parse = parseBody
+                                                        )
+                                                    )
+                                                    uploadMessage = if (parseBody != null) {
+                                                        "저장+OCR+구문분석 완료: ${item.code} / ${item.category.name}"
+                                                    } else {
+                                                        "저장+OCR 완료, 구문분석 실패 (${parseResponse.code()})"
+                                                    }
+                                                }.onFailure {
+                                                    onAnalysisReady(
+                                                        UploadAnalysisData(
+                                                            ocr = ocrBody,
+                                                            parse = null
+                                                        )
+                                                    )
+                                                    uploadMessage = "저장+OCR 완료, 구문분석 호출 실패"
+                                                }
+                                                "저장+OCR 완료: ${item.code} / ${item.category.name}"
+                                            } else {
+                                                "저장 완료, OCR 응답 파싱 실패"
+                                            }
+                                        } else {
+                                            "저장 완료, OCR 실패 (${ocrResponse.code()})"
+                                        }
+                                    }.onFailure {
+                                        uploadMessage = "저장 완료, OCR 호출 실패"
+                                    }
+                                }
+                            }
+                        }.onFailure {
+                            uploadMessage = "저장 실패"
+                        }
+                        uploading = false
+                    }
+                },
+                enabled = canAnalyze,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(46.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = BrandBlue)
+            ) {
+                Text("분석하기", color = Color.White, fontWeight = FontWeight.SemiBold)
+            }
+            uploadMessage?.let { msg ->
+                Text(msg, color = TextSecondary, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 4.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun UploadAnalysisResultContent(
+    result: UploadAnalysisData,
+    modifier: Modifier = Modifier,
+    onBack: () -> Unit
+) {
+    val isWide = LocalConfiguration.current.screenWidthDp >= 700
+    val cardRadius = RoundedCornerShape(18.dp)
+    Box(
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        Column(
+            modifier = Modifier
+                .width(960.dp)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 12.dp)
+                .padding(bottom = 96.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .softCardShadow(cardRadius),
+                shape = cardRadius,
+                colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowLeft,
+                            contentDescription = "뒤로가기",
+                            tint = TextPrimary,
+                            modifier = Modifier.size(30.dp)
+                        )
+                    }
+                    Text("분석 결과", color = TextPrimary, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            if (isWide) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Card(
+                        modifier = Modifier
+                            .weight(1f)
+                            .softCardShadow(cardRadius),
+                        shape = cardRadius,
+                        colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text("OCR 결과", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            Text(
+                                "${result.ocr.mockItem.code} · ${result.ocr.mockItem.category.name}",
+                                color = TextSecondary,
+                                fontSize = 12.sp
+                            )
+                            Text(result.ocr.mockItem.content.instruction, color = TextPrimary, fontSize = 13.sp)
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(320.dp)
+                                    .verticalScroll(rememberScrollState())
+                            ) {
+                                Text(
+                                    result.ocr.mockItem.content.passage,
+                                    color = TextSecondary,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                    }
+                    Card(
+                        modifier = Modifier
+                            .weight(1f)
+                            .softCardShadow(cardRadius),
+                        shape = cardRadius,
+                        colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(320.dp)
+                                .padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text("구문분석", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            val parse = result.parse
+                            if (parse == null) {
+                                Text("구문분석 결과를 불러오지 못했습니다.", color = TextSecondary, fontSize = 14.sp)
+                            } else {
+                                Text(parse.resultJson.summary, color = TextPrimary, fontSize = 13.sp)
+                                Text("문장 수 ${parse.resultJson.sentenceCount}", color = TextSecondary, fontSize = 12.sp)
+                                HorizontalDivider(color = BorderSoft)
+                                parse.resultJson.sentences.take(4).forEach { sentence ->
+                                    Text(
+                                        "${sentence.index}. ${sentence.text}",
+                                        color = TextSecondary,
+                                        fontSize = 12.sp,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(sentence.parse, color = TextPrimary, fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .softCardShadow(cardRadius),
+                    shape = cardRadius,
+                    colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("OCR 결과", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        Text(
+                            "${result.ocr.mockItem.code} · ${result.ocr.mockItem.category.name}",
+                            color = TextSecondary,
+                            fontSize = 12.sp
+                        )
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(300.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                result.ocr.mockItem.content.passage,
+                                color = TextSecondary,
+                                fontSize = 12.sp
+                            )
+                        }
+                        HorizontalDivider(color = BorderSoft)
+                        val parse = result.parse
+                        if (parse == null) {
+                            Text("구문분석 결과를 불러오지 못했습니다.", color = TextSecondary, fontSize = 14.sp)
+                        } else {
+                            Text(parse.resultJson.summary, color = TextPrimary, fontSize = 13.sp)
+                            Text("문장 수 ${parse.resultJson.sentenceCount}", color = TextSecondary, fontSize = 12.sp)
+                        }
+                    }
                 }
             }
         }

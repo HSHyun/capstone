@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -94,3 +95,21 @@ class LikeToggleResponse(BaseModel):
     post_id: int
     liked: bool
     like_count: int
+
+
+class DocumentUploadResponse(BaseModel):
+    document_id: int
+    image_url: str
+
+
+class DocumentOcrMockResponse(BaseModel):
+    document_id: int
+    status: str
+    mock_item: dict[str, Any]
+
+
+class DocumentParseMockResponse(BaseModel):
+    document_id: int
+    analysis_run_id: int
+    status: str
+    result_json: dict[str, Any]
